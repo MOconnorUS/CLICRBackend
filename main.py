@@ -1,7 +1,9 @@
 from fastapi import FastAPI, WebSocket
+from pydantic import BaseModel
 from typing import Dict
 from contextlib import asynccontextmanager
 from db import establish_connection, update, update_live_count
+from models import UpdateBody
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -20,26 +22,26 @@ app = FastAPI(lifespan=lifespan)
 async def ping():
     return {"result": "healthy"}
 
-@app.patch("/update/{venue}/{column}")
-async def update_entry(venue:str, column: str):
-    col_bool = False
+@app.patch("/update")
+async def update_entry(body: UpdateBody):
+    """
+    Asynchronous backend API route to update the live count in the Supabase Database.
+
+    ::param body the UpdateBody model to handle the body information
+    """
+    
     live_bool = False
 
-    try:
-        col_bool = update(venue, column)
-    except Exception as e:
-        return {f"Error Updating {column}": str(e)}
-
-    if col_bool is False:
-        return {f"Error Updating {column}": "Failed"}
+    ### NOTE: We need to add an error handling check when we migrate to phase 3 to check if the venue exists and if it doesn't
+    ### We need to return the appropriate value
     
     try:
-        live_bool = update_live_count(venue)
+        live_bool = update_live_count(body.venue, body.value)
     except Exception as e:
-        return {f"Error Updating Live Count for {venue}": str(e)}
+        return {f"Error Updating Live Count for {body.venue}": str(e)}
     
     if live_bool is False:
-        return {f"Error Updating Live Count for {venue}": "Failed"}
+        return {f"Error Updating Live Count for {body.venue}": "Failed"}
     
-    return {f"Success! You have updated {venue}'s {column}": "Pass"}
+    return {f"Success! You have updated {body.venue}'s Live Count to {body.value}": "Pass"}
 
