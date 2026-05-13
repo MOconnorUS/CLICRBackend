@@ -4,6 +4,9 @@ from typing import Dict
 from contextlib import asynccontextmanager
 from db import DB
 from models import UpdateBody
+    
+### NOTE: We need to add an error handling check when we migrate to phase 3 to check if the venue exists and if it doesn't
+### We need to return the appropriate value
 
 db = DB()
 
@@ -21,7 +24,26 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-active_connections: dict[str, list[WebSocket]] = {}
+active_connections: dict[str, dict[str, list[WebSocket] | int]] = {}
+
+async def broadcast(venue: str):
+    """
+    Initial websocket broadcasting function to send the live count to all those listening on the websocket. Phase 2 will send socket specific information.
+
+    ::param count the live count int
+    ::param entered the people entered
+    ::param exited the people exited
+    """
+    
+    if venue in active_connections:
+        for connection in active_connections[venue]["ws"]:
+            await connection.send_json(
+                {
+                    "count": active_connections[venue]["liveCount"], 
+                    "entered": active_connections[venue]["entered"], 
+                    "exited": active_connections[venue]["exited"]
+                }
+            )
 
 @app.websocket("/ws/{venue}")
 async def websocket_endpoint(websocket: WebSocket, venue: str):
@@ -34,31 +56,36 @@ async def websocket_endpoint(websocket: WebSocket, venue: str):
     await websocket.accept()
 
     if venue not in active_connections:
-        active_connections[venue] = []
+        active_connections[venue] = {
+            "ws": [],
+            "liveCount": 0,
+            "entered": 0,
+            "exited": 0
+        }
 
-    active_connections[venue].append(websocket)
+    active_connections[venue]["ws"].append(websocket)
 
     await initial_data(venue)
 
     try:
         while True:
-            await websocket.receive_text()
+            data = await websocket.receive_json()
+
+            if data["action"] == "increment":
+                active_connections[venue]["entered"] += 1
+                db.update(venue, active_connections[venue]["entered"], "people_entered")
+                
+            elif data["action"] == "decrement":
+                active_connections[venue]["exited"] += 1
+                db.update(venue, active_connections[venue]["exited"], "people_exited")
+
+            active_connections[venue]["liveCount"] = max(0, active_connections[venue]["entered"] - active_connections[venue]["exited"])
+            db.update(venue, active_connections[venue]["liveCount"])
+
+            await broadcast(venue)
     except Exception as e:
         print(f'WebSocket Exception: {e}')
-        active_connections[venue].remove(websocket)
-
-async def broadcast(venue: str, count: int, entered: int, exited: int):
-    """
-    Initial websocket broadcasting function to send the live count to all those listening on the websocket. Phase 2 will send socket specific information.
-
-    ::param count the live count int
-    ::param entered the people entered
-    ::param exited the people exited
-    """
-    
-    if venue in active_connections:
-        for connection in active_connections[venue]:
-            await connection.send_json({"count": count, "entered": entered, "exited": exited})
+        active_connections[venue]["ws"].remove(websocket)
 
 async def initial_data(venue: str):
     """
@@ -93,74 +120,13 @@ async def initial_data(venue: str):
     if type(liveCount) is str:
         return {f"Failed to fetch live count for {venue}": "Fail"}
     
-    await broadcast(venue, liveCount, entered, exited)
+    active_connections[venue]["liveCount"] = liveCount
+    active_connections[venue]["entered"] = entered
+    active_connections[venue]["exited"] = exited
+    
+    await broadcast(venue)
 
 
 @app.get("/health_check")
 async def ping():
-    return {"result": "healthy"}
-
-@app.patch("/update") 
-async def update_entry(body: UpdateBody):
-    """
-    Asynchronous backend API route to update the people entered and exited in the Supabase Database and then broadcast the live count.
-
-    ::param body the UpdateBody model to handle the body information
-    """
-
-    passUpdates = False
-    entered = 0
-    exited = 0
-    liveCount = 0
-
-    try:
-        entered = db.fetch(body.venue, "people_entered")
-    except Exception as e:
-        return {f"Error fetching people entered for {body.venue}": str(e)}
-
-    if type(entered) is str:
-        return {f"Failed to fetch people entered for {body.venue}": "Fail"}
-
-    try:
-        exited = db.fetch(body.venue, "people_exited")
-    except Exception as e:
-        return {f"Error fetching people exited for {body.venue}": str(e)}
-    
-    if type(exited) is str:
-        return {f"Failed to fetch people exited for {body.venue}": "Fail"}
-    
-    entered += body.entered
-    exited += body.exited
-
-    liveCount = max(0, entered - exited)
-    
-    try:
-        passUpdates = db.update(body.venue, entered, "people_entered")
-    except Exception as e:
-        return {f"Error updating people entered for {body.venue}": str(e)}
-    
-    if passUpdates is False:
-        return {f"Failed to update people entered for {body.venue}": "Fail"}
-    
-    try:
-        passUpdates = db.update(body.venue, exited, "people_exited")
-    except Exception as e:
-        return {f"Error updating people exited for {body.venue}": str(e)}
-    
-    if passUpdates is False:
-        return {f"Failed to update people entered for {body.venue}": "Fail"}
-    
-    ### NOTE: We need to add an error handling check when we migrate to phase 3 to check if the venue exists and if it doesn't
-    ### We need to return the appropriate value
-    
-    try:
-        passUpdates = db.update(body.venue, liveCount)
-    except Exception as e:
-        return {f"Error Updating Live Count for {body.venue}": str(e)}
-    
-    if passUpdates is False:
-        return {f"Error Updating Live Count for {body.venue}": "Failed"}
-    
-    await broadcast(body.venue, liveCount, entered, exited)
-    
-    return {f"Success! You have updated {body.venue}'s Live Count to {liveCount}": "Pass"}
+    return {"result": "healthy"}    
