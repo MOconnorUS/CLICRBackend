@@ -1,14 +1,49 @@
+import os
+import asyncio
+
 from fastapi import FastAPI, WebSocket
+from redis.asyncio import Redis
 from pydantic import BaseModel
 from typing import Dict
 from contextlib import asynccontextmanager
 from db import DB
 from models import UpdateBody
+from dotenv import load_dotenv
     
 ### NOTE: We need to add an error handling check when we migrate to phase 3 to check if the venue exists and if it doesn't
 ### We need to return the appropriate value
+load_dotenv()
 
 db = DB()
+redis = Redis(
+    host=os.getenv("REDIS_ENDPOINT"),
+    port=16840,
+    password=os.getenv("REDIS_PASSWORD"),
+    ssl=False,
+    decode_responses=True
+)
+
+async def periodic_flush():
+    """
+    Periodic cache flushing system to update the DB with the Redis cache as a safety net incase we have a crash. This will be a background process.
+    """
+
+    while True:
+        await asyncio.sleep(300) 
+        await flush_all_venues_to_db()
+
+async def flush_all_venues_to_db():
+    """
+    Flush all venues into the DB from the cache based on the periodic flushing function. Ensures we keep accurate counts.
+    """
+    
+    keys = await redis.keys("venue:*")
+    for key in keys:
+        data = await redis.hgetall(key)
+        venue_id = key.split(":")[1]
+        db.update(venue_id, int(data["entered"]), "people_entered")
+        db.update(venue_id, int(data["exited"]),  "people_exited")
+        db.update(venue_id, int(data["liveCount"]))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -20,11 +55,11 @@ async def lifespan(app: FastAPI):
     """
 
     db.establish_connection()
+    asyncio.create_task(periodic_flush())
     yield
 
 app = FastAPI(lifespan=lifespan)
-
-active_connections: dict[str, dict[str, list[WebSocket] | int]] = {}
+active_connections: dict[str, list[WebSocket]] = {}
 
 async def broadcast(venue: str):
     """
@@ -36,12 +71,12 @@ async def broadcast(venue: str):
     """
     
     if venue in active_connections:
-        for connection in active_connections[venue]["ws"]:
+        for connection in active_connections[venue]:
             await connection.send_json(
                 {
-                    "count": active_connections[venue]["liveCount"], 
-                    "entered": active_connections[venue]["entered"], 
-                    "exited": active_connections[venue]["exited"]
+                    "count": await redis.hget(f"venue:{venue}", "liveCount"),
+                    "entered": await redis.hget(f"venue:{venue}", "entered"),
+                    "exited": await redis.hget(f"venue:{venue}", "exited")
                 }
             )
 
@@ -56,14 +91,9 @@ async def websocket_endpoint(websocket: WebSocket, venue: str):
     await websocket.accept()
 
     if venue not in active_connections:
-        active_connections[venue] = {
-            "ws": [],
-            "liveCount": 0,
-            "entered": 0,
-            "exited": 0
-        }
+        active_connections[venue] = []
 
-    active_connections[venue]["ws"].append(websocket)
+    active_connections[venue].append(websocket)
 
     await initial_data(venue)
 
@@ -72,20 +102,27 @@ async def websocket_endpoint(websocket: WebSocket, venue: str):
             data = await websocket.receive_json()
 
             if data["action"] == "increment":
-                active_connections[venue]["entered"] += 1
-                db.update(venue, active_connections[venue]["entered"], "people_entered")
+                await redis.hincrby(f"venue:{venue}", "entered", 1)
                 
             elif data["action"] == "decrement":
-                active_connections[venue]["exited"] += 1
-                db.update(venue, active_connections[venue]["exited"], "people_exited")
-
-            active_connections[venue]["liveCount"] = max(0, active_connections[venue]["entered"] - active_connections[venue]["exited"])
-            db.update(venue, active_connections[venue]["liveCount"])
+                await redis.hincrby(f"venue:{venue}", "exited", 1)
+            
+            entered = await redis.hget(f"venue:{venue}", "entered")
+            exited  = await redis.hget(f"venue:{venue}", "exited")
+            live = max(0, int(entered) - int(exited))
+            await redis.hset(f"venue:{venue}", "liveCount", live)
 
             await broadcast(venue)
     except Exception as e:
         print(f'WebSocket Exception: {e}')
-        active_connections[venue]["ws"].remove(websocket)
+        active_connections[venue].remove(websocket)
+
+        if len(active_connections[venue]) == 0:
+            data = await redis.hgetall(f"venue:{venue}")
+            db.update(venue, int(data["entered"]), "people_entered")
+            db.update(venue, int(data["exited"]),  "people_exited")
+            db.update(venue, int(data["liveCount"]))
+            await redis.delete(f"venue:{venue}")
 
 async def initial_data(venue: str):
     """
@@ -119,14 +156,11 @@ async def initial_data(venue: str):
     
     if type(liveCount) is str:
         return {f"Failed to fetch live count for {venue}": "Fail"}
-    
-    active_connections[venue]["liveCount"] = liveCount
-    active_connections[venue]["entered"] = entered
-    active_connections[venue]["exited"] = exited
-    
-    await broadcast(venue)
 
-
-@app.get("/health_check")
-async def ping():
-    return {"result": "healthy"}    
+    await redis.hset(f"venue:{venue}", mapping={
+        "entered": entered,
+        "exited": exited,
+        "liveCount": liveCount
+    })
+    
+    await broadcast(venue) 
