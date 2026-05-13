@@ -65,23 +65,6 @@ class DB:
         
         return True
 
-# def update_live_count(venue: str, value: int) -> bool:
-#     """
-#     Updates the live count at the venue by fetching the people entered and exited and doing a subtraction update
-
-#     ::param venue the venue name
-#     ::param value the live count value sent from the app
-#     ::return True upon success and Fvaluealse otherwise
-#     """
-
-#     try:
-#         supabase.table("testIncrement").update({"live_count": value}).eq("venue", venue).execute()
-#     except Exception as e:
-#         print(f'Error Updating Live Count: {e}')
-#         return False
-    
-#     return True
-
     # Note: we would use this function below to create a new venue in our table to store their data, eventually we may want the venue name to be a 
     # Primary key to another table to store their historicals so we can draw on it for the insights.
     def insert(self) -> bool:
