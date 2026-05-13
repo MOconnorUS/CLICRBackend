@@ -44,8 +44,6 @@ def fetch(venue: str, column: str) -> int | str:
 
     return data[0][column]
 
-# This may be an obsolete function for prod and only good for testing because we can just update the live count with the state sent from
-# the app
 def update(venue: str, column: str, value: int) -> bool:
     """
     Updates either the entered or exited data.
