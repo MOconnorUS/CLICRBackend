@@ -2,8 +2,10 @@ from fastapi import FastAPI, WebSocket
 from pydantic import BaseModel
 from typing import Dict
 from contextlib import asynccontextmanager
-from db import establish_connection, update, update_live_count, fetch
+from db import DB
 from models import UpdateBody
+
+db = DB()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -13,15 +15,16 @@ async def lifespan(app: FastAPI):
 
     ::param app the FastAPI backend app
     """
-    establish_connection()
+
+    db.establish_connection()
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-active_connections: list[WebSocket] = []
+active_connections: dict[str, list[WebSocket]] = {}
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+@app.websocket("/ws/{venue}")
+async def websocket_endpoint(websocket: WebSocket, venue: str):
     """
     Initial websocket endpoint. This will serve as phase 1 of 2 with websockets to establish a single live connection. Phase 2 will have per venue sockets
 
@@ -29,16 +32,22 @@ async def websocket_endpoint(websocket: WebSocket):
     """
     
     await websocket.accept()
-    active_connections.append(websocket)
+
+    if venue not in active_connections:
+        active_connections[venue] = []
+
+    active_connections[venue].append(websocket)
+
+    await initial_data(venue)
 
     try:
         while True:
             await websocket.receive_text()
     except Exception as e:
         print(f'WebSocket Exception: {e}')
-        active_connections.remove(websocket)
+        active_connections[venue].remove(websocket)
 
-async def broadcast(count: int, entered: int, exited: int):
+async def broadcast(venue: str, count: int, entered: int, exited: int):
     """
     Initial websocket broadcasting function to send the live count to all those listening on the websocket. Phase 2 will send socket specific information.
 
@@ -47,8 +56,45 @@ async def broadcast(count: int, entered: int, exited: int):
     ::param exited the people exited
     """
     
-    for connection in active_connections:
-        await connection.send_json({"count": count, "entered": entered, "exited": exited})
+    if venue in active_connections:
+        for connection in active_connections[venue]:
+            await connection.send_json({"count": count, "entered": entered, "exited": exited})
+
+async def initial_data(venue: str):
+    """
+    Grabs the initial data from the database via fetch and sends it to be broadcasted.
+    """
+
+    entered = 0
+    exited = 0
+    liveCount = 0
+
+    try:
+        entered = db.fetch(venue, "people_entered")
+    except Exception as e:
+        return {f"Error fetching people entered for {venue}": str(e)}
+    
+    if type(entered) is str:
+        return {f"Failed to fetch people entered for {venue}": "Fail"}
+    
+    try:
+        exited = db.fetch(venue, "people_exited")
+    except Exception as e:
+        return {f"Error fetching people exited for {venue}": str(e)}
+    
+    if type(exited) is str:
+        return {f"Failed to fetch people exited for {venue}": str(e)}
+
+    try:
+        liveCount = db.fetch(venue, "live_count")
+    except Exception as e:
+        return {f"Error fetching live count for {venue}": str(e)}
+    
+    if type(liveCount) is str:
+        return {f"Failed to fetch live count for {venue}": "Fail"}
+    
+    await broadcast(venue, liveCount, entered, exited)
+
 
 @app.get("/health_check")
 async def ping():
@@ -68,7 +114,7 @@ async def update_entry(body: UpdateBody):
     liveCount = 0
 
     try:
-        entered = fetch(body.venue, "people_entered")
+        entered = db.fetch(body.venue, "people_entered")
     except Exception as e:
         return {f"Error fetching people entered for {body.venue}": str(e)}
 
@@ -76,7 +122,7 @@ async def update_entry(body: UpdateBody):
         return {f"Failed to fetch people entered for {body.venue}": "Fail"}
 
     try:
-        exited = fetch(body.venue, "people_exited")
+        exited = db.fetch(body.venue, "people_exited")
     except Exception as e:
         return {f"Error fetching people exited for {body.venue}": str(e)}
     
@@ -89,7 +135,7 @@ async def update_entry(body: UpdateBody):
     liveCount = max(0, entered - exited)
     
     try:
-        passUpdates = update(body.venue, "people_entered", entered)
+        passUpdates = db.update(body.venue, entered, "people_entered")
     except Exception as e:
         return {f"Error updating people entered for {body.venue}": str(e)}
     
@@ -97,7 +143,7 @@ async def update_entry(body: UpdateBody):
         return {f"Failed to update people entered for {body.venue}": "Fail"}
     
     try:
-        passUpdates = update(body.venue, "people_exited", exited)
+        passUpdates = db.update(body.venue, exited, "people_exited")
     except Exception as e:
         return {f"Error updating people exited for {body.venue}": str(e)}
     
@@ -108,13 +154,13 @@ async def update_entry(body: UpdateBody):
     ### We need to return the appropriate value
     
     try:
-        passUpdates = update_live_count(body.venue, liveCount)
+        passUpdates = db.update(body.venue, liveCount)
     except Exception as e:
         return {f"Error Updating Live Count for {body.venue}": str(e)}
     
     if passUpdates is False:
         return {f"Error Updating Live Count for {body.venue}": "Failed"}
     
-    await broadcast(liveCount, entered, exited)
+    await broadcast(body.venue, liveCount, entered, exited)
     
     return {f"Success! You have updated {body.venue}'s Live Count to {liveCount}": "Pass"}
