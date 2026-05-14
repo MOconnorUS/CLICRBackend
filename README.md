@@ -18,5 +18,5 @@ Simplified prototype implementation of CLICR backend
 - Supabase
 
 ## Notes
-This project is configured for local use only
-Environment variables are intentionally omitted
+This project is configured for local use only.
+Environment variables are intentionally omitted.
